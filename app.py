@@ -1,109 +1,104 @@
-import srt
 import io
-import os
-from concurrent.futures import ThreadPoolExecutor
 
-from flask import Flask, request, send_file, render_template
-from pydub import AudioSegment
-import azure.cognitiveservices.speech as speechsdk
+def get_audio_duration(file_path):
+    result = subprocess.run(
+        ["ffprobe", "-i", file_path, "-show_entries",
+         "format=duration", "-v", "quiet", "-of", "csv=p=0"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT
+    )
+    return float(result.stdout)
 
-app = Flask(__name__)
-
-speech_key = os.environ.get("SPEECH_KEY")
-service_region = os.environ.get("SPEECH_REGION")
-
-
-# ===== PARSE SRT =====
-def parse_srt(content):
-    subtitles = list(srt.parse(content))
-    return [(sub.start.total_seconds(), sub.end.total_seconds(), sub.content) for sub in subtitles]
-
-
-# ===== ESTIMATE SPEED =====
-def estimate_rate(text, target_duration):
-    words = len(text.split())
-    expected = words * 0.4
-    if target_duration == 0:
-        return "1.0"
-    rate = expected / target_duration
-    return f"{rate:.2f}"
-
-
-# ===== AZURE TTS =====
-def tts(text, voice, rate):
-    speech_config = speechsdk.SpeechConfig(subscription=speech_key, region=service_region)
-    speech_config.speech_synthesis_voice_name = voice
-
-    ssml = f"""
-    <speak version='1.0'>
-      <voice name='{voice}'>
-        <prosody rate='{rate}'>
-          {text}
-        </prosody>
-      </voice>
-    </speak>
-    """
-
-    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
-    result = synthesizer.speak_ssml_async(ssml).get()
-
-    if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-        return result.audio_data
-    return None
-
-
-# ===== XỬ LÝ 1 SEGMENT =====
-def process_segment(args):
-    i, start, end, text, voice = args
-
-    duration = end - start
-    rate = estimate_rate(text, duration)
-
-    audio_data = tts(text, voice, rate)
-
-    if audio_data is None:
-        return (start, AudioSegment.silent(duration=duration * 1000))
-
-    audio = AudioSegment.from_file(io.BytesIO(audio_data), format="wav")
-    return (start, audio)
-
-
-# ===== ROUTE UI =====
-@app.route("/")
-def home():
-    return render_template("index.html")
-
-
-# ===== API =====
 @app.route("/upload", methods=["POST"])
 def upload():
     file = request.files["file"]
-    voice = request.form.get("voice", "vi-VN-HoaiMyNeural")
+    voice = request.form["voice"]
 
-    content = file.read().decode("utf-8")
-    segments = parse_srt(content)
+    input_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(input_path)
 
-    tasks = [(i, start, end, text, voice) for i, (start, end, text) in enumerate(segments)]
+    subs = parse_srt(input_path)
 
-    # ⚡ chạy song song
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        results = list(executor.map(process_segment, tasks))
+    timeline_audio = f"{OUTPUT_FOLDER}/timeline.wav"
 
-    results.sort(key=lambda x: x[0])
+    # 👉 bắt đầu bằng audio rỗng
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono", "-t", "0", timeline_audio])
 
-    combined = AudioSegment.silent(duration=0)
+    current_time = 0
 
-    for start, audio in results:
-        silence = AudioSegment.silent(duration=(start * 1000) - len(combined))
-        combined += silence + audio
+    for i, sub in enumerate(subs):
+        start = sub.start.total_seconds()
+        end = sub.end.total_seconds()
+        duration = end - start
 
-    output = io.BytesIO()
-    combined.export(output, format="mp3")
-    output.seek(0)
+        # 👉 tạo audio từ Azure
+        audio_data = tts_azure(sub.content, voice)
+        if not audio_data:
+            continue
 
-    return send_file(output, as_attachment=True, download_name="output.mp3", mimetype="audio/mpeg")
+        temp_wav = f"{OUTPUT_FOLDER}/seg_{i}.wav"
+        with open(temp_wav, "wb") as f:
+            f.write(audio_data)
 
+        real_duration = get_audio_duration(temp_wav)
 
-# ===== RUN =====
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=3000)
+        adjusted_wav = f"{OUTPUT_FOLDER}/adj_{i}.wav"
+
+        # 🎯 nếu dài hơn → tăng tốc
+        if real_duration > duration:
+            speed = real_duration / duration
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", temp_wav,
+                "-filter:a", f"atempo={speed}",
+                adjusted_wav
+            ])
+        else:
+            # 🎯 nếu ngắn → thêm silence
+            silence_time = duration - real_duration
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", temp_wav,
+                "-f", "lavfi",
+                "-t", str(silence_time),
+                "-i", "anullsrc",
+                "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
+                adjusted_wav
+            ])
+
+        # 👉 chèn vào đúng vị trí timeline
+        delay = max(0, start - current_time)
+
+        final_seg = f"{OUTPUT_FOLDER}/final_{i}.wav"
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", adjusted_wav,
+            "-af", f"adelay={int(delay*1000)}|{int(delay*1000)}",
+            final_seg
+        ])
+
+        # 👉 merge vào timeline
+        merged = f"{OUTPUT_FOLDER}/merged_{i}.wav"
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", timeline_audio,
+            "-i", final_seg,
+            "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest",
+            merged
+        ])
+
+        os.replace(merged, timeline_audio)
+        current_time = start + duration
+
+    output_mp3 = f"{OUTPUT_FOLDER}/output.mp3"
+
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", timeline_audio,
+        "-acodec", "libmp3lame",
+        output_mp3
+    ])
+
+    return send_file(output_mp3, as_attachment=True)
