@@ -1,4 +1,5 @@
-flask
-gunicorn
-azure-cognitiveservices-speech
-srt
+Flask==3.0.3
+gunicorn==22.0.0
+azure-cognitiveservices-speech==1.37.0
+srt==3.5.3
+pydub==0.25.1
