@@ -1,13 +1,67 @@
-import io
+from flask import Flask, request, send_file
+import os
+import subprocess
+import srt
+import azure.cognitiveservices.speech as speechsdk
+
+# 🔥 QUAN TRỌNG: phải có dòng này trước @app.route
+app = Flask(__name__)
+
+UPLOAD_FOLDER = "uploads"
+OUTPUT_FOLDER = "outputs"
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# 🔑 Azure config
+SPEECH_KEY = "YOUR_KEY"
+SERVICE_REGION = "eastasia"
+
+
+# =========================
+# 🧠 FUNCTIONS
+# =========================
+
+def parse_srt(file_path):
+    with open(file_path, "r", encoding="utf-8") as f:
+        return list(srt.parse(f.read()))
+
+
+def tts_azure(text, voice):
+    speech_config = speechsdk.SpeechConfig(
+        subscription=SPEECH_KEY,
+        region=SERVICE_REGION
+    )
+    speech_config.speech_synthesis_voice_name = voice
+
+    synthesizer = speechsdk.SpeechSynthesizer(
+        speech_config=speech_config,
+        audio_config=None
+    )
+
+    result = synthesizer.speak_text_async(text).get()
+
+    if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+        return result.audio_data
+    return None
+
 
 def get_audio_duration(file_path):
     result = subprocess.run(
-        ["ffprobe", "-i", file_path, "-show_entries",
-         "format=duration", "-v", "quiet", "-of", "csv=p=0"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT
+        [
+            "ffprobe", "-i", file_path,
+            "-show_entries", "format=duration",
+            "-v", "quiet",
+            "-of", "csv=p=0"
+        ],
+        stdout=subprocess.PIPE
     )
     return float(result.stdout)
+
+
+# =========================
+# 🚀 ROUTE
+# =========================
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -21,8 +75,14 @@ def upload():
 
     timeline_audio = f"{OUTPUT_FOLDER}/timeline.wav"
 
-    # 👉 bắt đầu bằng audio rỗng
-    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono", "-t", "0", timeline_audio])
+    # tạo audio rỗng ban đầu
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", "anullsrc=r=22050:cl=mono",
+        "-t", "0",
+        timeline_audio
+    ])
 
     current_time = 0
 
@@ -31,7 +91,6 @@ def upload():
         end = sub.end.total_seconds()
         duration = end - start
 
-        # 👉 tạo audio từ Azure
         audio_data = tts_azure(sub.content, voice)
         if not audio_data:
             continue
@@ -41,21 +100,27 @@ def upload():
             f.write(audio_data)
 
         real_duration = get_audio_duration(temp_wav)
-
         adjusted_wav = f"{OUTPUT_FOLDER}/adj_{i}.wav"
 
-        # 🎯 nếu dài hơn → tăng tốc
+        # 🔥 FIX: atempo > 2 sẽ lỗi → chia nhỏ
         if real_duration > duration:
             speed = real_duration / duration
+
+            filters = []
+            while speed > 2.0:
+                filters.append("atempo=2.0")
+                speed /= 2.0
+            filters.append(f"atempo={speed}")
+
             subprocess.run([
                 "ffmpeg", "-y",
                 "-i", temp_wav,
-                "-filter:a", f"atempo={speed}",
+                "-filter:a", ",".join(filters),
                 adjusted_wav
             ])
         else:
-            # 🎯 nếu ngắn → thêm silence
             silence_time = duration - real_duration
+
             subprocess.run([
                 "ffmpeg", "-y",
                 "-i", temp_wav,
@@ -66,7 +131,6 @@ def upload():
                 adjusted_wav
             ])
 
-        # 👉 chèn vào đúng vị trí timeline
         delay = max(0, start - current_time)
 
         final_seg = f"{OUTPUT_FOLDER}/final_{i}.wav"
@@ -78,7 +142,6 @@ def upload():
             final_seg
         ])
 
-        # 👉 merge vào timeline
         merged = f"{OUTPUT_FOLDER}/merged_{i}.wav"
 
         subprocess.run([
@@ -102,3 +165,11 @@ def upload():
     ])
 
     return send_file(output_mp3, as_attachment=True)
+
+
+# =========================
+# ▶️ RUN
+# =========================
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
