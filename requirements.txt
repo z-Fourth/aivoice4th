@@ -1,4 +1,4 @@
 flask
-pydub
-srt
+gunicorn
 azure-cognitiveservices-speech
+srt
