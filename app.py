@@ -57,13 +57,14 @@ def upload():
 
     subs = parse_srt(input_path)
     final_files = []
+    current_time = 0  # timeline
 
     for i, sub in enumerate(subs):
         start = sub.start.total_seconds()
         end = sub.end.total_seconds()
         duration = end - start
 
-        # TTS
+        # 🔹 TTS Azure
         audio_data = tts_azure(sub.content, voice)
         if not audio_data:
             continue
@@ -72,43 +73,44 @@ def upload():
         with open(temp_wav, "wb") as f:
             f.write(audio_data)
 
-        # Adjust duration
+        # 🔹 Điều chỉnh duration
         real_duration = get_audio_duration(temp_wav)
         adjusted_wav = f"{OUTPUT_FOLDER}/adj_{i}.wav"
 
         if real_duration > duration:
-            # tăng tốc nếu dài hơn
             speed = real_duration / duration
             filters = []
             while speed > 2.0:
                 filters.append("atempo=2.0")
                 speed /= 2.0
             filters.append(f"atempo={speed}")
-            subprocess.run([
-                "ffmpeg", "-y", "-i", temp_wav, "-filter:a", ",".join(filters), adjusted_wav
-            ])
+            subprocess.run(["ffmpeg", "-y", "-i", temp_wav, "-filter:a", ",".join(filters), adjusted_wav])
         else:
-            # thêm silence nếu ngắn hơn
             silence_time = duration - real_duration
             subprocess.run([
                 "ffmpeg", "-y",
                 "-i", temp_wav,
-                "-f", "lavfi", "-t", str(silence_time), "-i", "anullsrc",
+                "-f", "lavfi", "-t", str(silence_time), "-i", "anullsrc=r=22050:cl=mono",
                 "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
                 adjusted_wav
             ])
 
-        # Áp dụng delay theo start time
-        delay_ms = int(start * 1000)
-        final_seg = f"{OUTPUT_FOLDER}/final_{i}.wav"
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-i", adjusted_wav,
-            "-af", f"adelay={delay_ms}|{delay_ms}",
-            final_seg
-        ])
+        # 🔹 Thêm silence trước câu nếu cần để timeline đúng
+        silence_before = start - current_time
+        if silence_before > 0:
+            with_silence = f"{OUTPUT_FOLDER}/final_{i}.wav"
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-t", str(silence_before), "-i", "anullsrc=r=22050:cl=mono",
+                "-i", adjusted_wav,
+                "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
+                with_silence
+            ])
+        else:
+            with_silence = adjusted_wav
 
-        final_files.append(final_seg)
+        final_files.append(with_silence)
+        current_time = end  # cập nhật timeline
 
     # 🔹 Tạo file list để concat
     list_path = os.path.join(OUTPUT_FOLDER, "concat_list.txt")
@@ -116,25 +118,13 @@ def upload():
         for file_path in final_files:
             f.write(f"file '{file_path}'\n")
 
-    # 🔹 Concat giữ timeline
+    # 🔹 Concat tất cả các file theo thứ tự
     output_wav = os.path.join(OUTPUT_FOLDER, "output.wav")
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_path,
-        "-c", "copy",
-        output_wav
-    ])
+    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", output_wav])
 
     # 🔹 Convert sang MP3
     output_mp3 = os.path.join(OUTPUT_FOLDER, "output.mp3")
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", output_wav,
-        "-acodec", "libmp3lame",
-        output_mp3
-    ])
+    subprocess.run(["ffmpeg", "-y", "-i", output_wav, "-acodec", "libmp3lame", output_mp3])
 
     return send_file(output_mp3, as_attachment=True)
 
