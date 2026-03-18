@@ -1,14 +1,19 @@
 from flask import Flask, request, send_file, render_template
 import os
-import subprocess
 import srt
+import time
+import io
+import subprocess
+from datetime import timedelta
+from collections import Counter
+
 import azure.cognitiveservices.speech as speechsdk
 from pydub import AudioSegment
+from langdetect import detect
 
 app = Flask(__name__)
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 OUTPUT_FOLDER = os.path.join(BASE_DIR, "outputs")
 
@@ -24,65 +29,109 @@ SERVICE_REGION = "eastus"
 # =========================
 
 def parse_srt(file_path):
-    with open(file_path, "r", encoding="utf-8") as f:
-        return list(srt.parse(f.read()))
+    with open(file_path, 'r', encoding='utf-8') as f:
+        subs = srt.parse(f.read())
+        return [(sub.start, sub.end, sub.content) for sub in subs]
 
-def tts_azure(text, voice):
+
+def detect_majority_language(segments):
+    langs = []
+    for _, _, content in segments:
+        try:
+            langs.append(detect(content))
+        except:
+            pass
+    return Counter(langs).most_common(1)[0][0] if langs else "en"
+
+
+def tts_azure_to_file(text, voice, rate, output_path):
     speech_config = speechsdk.SpeechConfig(
         subscription=SPEECH_KEY,
         region=SERVICE_REGION
     )
 
-    # ✅ FIX: output WAV chuẩn
-    speech_config.set_speech_synthesis_output_format(
-        speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm
-    )
-
     speech_config.speech_synthesis_voice_name = voice
+
+    ssml = f"""
+    <speak version='1.0' xml:lang='{voice.split('-')[0]}'>
+        <voice name='{voice}'>
+            <prosody rate='{rate}'>
+                {text}
+            </prosody>
+        </voice>
+    </speak>
+    """
+
+    audio_config = speechsdk.audio.AudioOutputConfig(filename=output_path)
 
     synthesizer = speechsdk.SpeechSynthesizer(
         speech_config=speech_config,
-        audio_config=None
+        audio_config=audio_config
     )
 
-    result = synthesizer.speak_text_async(text).get()
+    result = synthesizer.speak_ssml_async(ssml).get()
 
-    if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-        return bytes(result.audio_data)
-
-    print("TTS ERROR:", result.reason)
-    return None
+    return result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted
 
 
-def get_audio_duration(file_path):
+def get_duration(file_path):
     result = subprocess.run(
-        [
-            "ffprobe", "-i", file_path,
-            "-show_entries", "format=duration",
-            "-v", "quiet",
-            "-of", "csv=p=0"
-        ],
+        ["ffprobe", "-i", file_path,
+         "-show_entries", "format=duration",
+         "-v", "quiet",
+         "-of", "csv=p=0"],
         stdout=subprocess.PIPE
     )
     return float(result.stdout)
 
 
-def run_ffmpeg(cmd):
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+# =========================
+# 🔥 CORE PROCESS
+# =========================
 
+def process_segments(segments, voice):
+    combined = AudioSegment.silent(duration=0)
+    current_time = 0
 
-# ✅ NEW: merge bằng pydub (KHÔNG dùng ffmpeg concat)
-def merge_audio(files, output_path):
-    final_audio = AudioSegment.silent(duration=0)
+    for i, (start, end, text) in enumerate(segments):
+        print(f"Processing segment {i}")
 
-    for f in files:
-        if os.path.exists(f):
-            segment = AudioSegment.from_wav(f)
-            final_audio += segment
+        target_duration = (end - start).total_seconds()
+
+        raw_path = f"{OUTPUT_FOLDER}/raw_{i}.wav"
+        final_path = f"{OUTPUT_FOLDER}/final_{i}.wav"
+
+        # 🔁 Retry logic
+        for _ in range(3):
+            if tts_azure_to_file(text, voice, "1.0", raw_path):
+                break
+            time.sleep(2)
+
+        if not os.path.exists(raw_path):
+            print("TTS failed → silence")
+            audio = AudioSegment.silent(duration=target_duration * 1000)
         else:
-            print("Missing file:", f)
+            real_duration = get_duration(raw_path)
+            speed = real_duration / target_duration
 
-    final_audio.export(output_path, format="wav")
+            for _ in range(3):
+                if tts_azure_to_file(text, voice, str(speed), final_path):
+                    break
+                time.sleep(2)
+
+            if os.path.exists(final_path):
+                audio = AudioSegment.from_wav(final_path)
+            else:
+                audio = AudioSegment.silent(duration=target_duration * 1000)
+
+        # ⏱ sync timeline
+        silence_before = start.total_seconds() * 1000 - len(combined)
+        if silence_before > 0:
+            combined += AudioSegment.silent(duration=silence_before)
+
+        combined += audio
+
+    return combined
 
 
 # =========================
@@ -96,124 +145,40 @@ def index():
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    file = request.files["file"]
-    voice = request.form["voice"]
+    try:
+        file = request.files["file"]
+        voice = request.form.get("voice", "vi-VN-HoaiMyNeural")
 
-    input_path = os.path.join(UPLOAD_FOLDER, file.filename)
-    file.save(input_path)
+        input_path = os.path.join(UPLOAD_FOLDER, file.filename)
+        file.save(input_path)
 
-    subs = parse_srt(input_path)
+        segments = parse_srt(input_path)
 
-    if len(subs) == 0:
-        return {"error": "Empty SRT file"}
+        if not segments:
+            return {"error": "Empty SRT"}
 
-    final_files = []
-    current_time = 0
+        combined_audio = process_segments(segments, voice)
 
-    for i, sub in enumerate(subs):
-        start = sub.start.total_seconds()
-        end = sub.end.total_seconds()
-        duration = end - start
+        output_wav = os.path.join(OUTPUT_FOLDER, "output.wav")
+        output_mp3 = os.path.join(OUTPUT_FOLDER, "output.mp3")
 
-        audio_data = tts_azure(sub.content, voice)
-        if not audio_data:
-            continue
+        combined_audio.export(output_wav, format="wav")
 
-        temp_wav = f"{OUTPUT_FOLDER}/seg_{i}.wav"
-        with open(temp_wav, "wb") as f:
-            f.write(audio_data)
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", output_wav,
+            "-codec:a", "libmp3lame",
+            "-b:a", "192k",
+            output_mp3
+        ])
 
-        real_duration = get_audio_duration(temp_wav)
-        adjusted_wav = f"{OUTPUT_FOLDER}/adj_{i}.wav"
+        if not os.path.exists(output_mp3):
+            return {"error": "MP3 failed"}
 
-        # normalize + adjust speed
-        if real_duration > duration:
-            speed = real_duration / duration
-            filters = []
+        return send_file(output_mp3, as_attachment=True)
 
-            while speed > 2.0:
-                filters.append("atempo=2.0")
-                speed /= 2.0
-
-            filters.append(f"atempo={speed}")
-
-            run_ffmpeg([
-                "ffmpeg", "-y",
-                "-i", temp_wav,
-                "-filter:a", ",".join(filters),
-                "-ar", "44100",
-                "-ac", "2",
-                adjusted_wav
-            ])
-        else:
-            silence_time = duration - real_duration
-
-            run_ffmpeg([
-                "ffmpeg", "-y",
-                "-i", temp_wav,
-                "-f", "lavfi",
-                "-t", str(silence_time),
-                "-i", "anullsrc=r=44100:cl=stereo",
-                "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
-                "-ar", "44100",
-                "-ac", "2",
-                adjusted_wav
-            ])
-
-        # thêm silence đầu để sync
-        silence_before = start - current_time
-
-        if silence_before > 0:
-            with_silence = f"{OUTPUT_FOLDER}/final_{i}.wav"
-
-            run_ffmpeg([
-                "ffmpeg", "-y",
-                "-f", "lavfi",
-                "-t", str(silence_before),
-                "-i", "anullsrc=r=44100:cl=stereo",
-                "-i", adjusted_wav,
-                "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
-                "-ar", "44100",
-                "-ac", "2",
-                with_silence
-            ])
-        else:
-            with_silence = adjusted_wav
-
-        final_files.append(with_silence)
-        current_time = end
-
-    if len(final_files) == 0:
-        return {"error": "No audio generated"}
-
-    # ✅ merge bằng pydub
-    output_wav = os.path.join(OUTPUT_FOLDER, "output.wav")
-    merge_audio(final_files, output_wav)
-
-    if not os.path.exists(output_wav):
-        return {"error": "WAV not created"}
-
-    # convert sang MP3
-    output_mp3 = os.path.join(OUTPUT_FOLDER, "output.mp3")
-
-    run_ffmpeg([
-        "ffmpeg", "-y",
-        "-i", output_wav,
-        "-vn",
-        "-ar", "44100",
-        "-ac", "2",
-        "-b:a", "192k",
-        output_mp3
-    ])
-
-    if not os.path.exists(output_mp3) or os.path.getsize(output_mp3) == 0:
-        return {"error": "MP3 failed"}
-
-    return send_file(
-        output_mp3,
-        as_attachment=True,
-        mimetype="audio/mpeg"
-    )
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # =========================
