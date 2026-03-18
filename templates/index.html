@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SRT → Audio</title>
+
+<style>
+body {
+    margin: 0;
+    font-family: Arial;
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.container {
+    background: rgba(255,255,255,0.1);
+    backdrop-filter: blur(15px);
+    padding: 30px;
+    border-radius: 20px;
+    text-align: center;
+    color: white;
+    width: 320px;
+}
+
+input, select, button {
+    width: 100%;
+    margin-top: 10px;
+    padding: 10px;
+    border-radius: 10px;
+    border: none;
+}
+
+button {
+    background: #00c6ff;
+    color: white;
+    font-weight: bold;
+    cursor: pointer;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+    <h2>🎤 SRT → Audio</h2>
+
+    <input type="file" id="file" accept=".srt">
+
+    <select id="voice">
+        <option value="vi-VN-HoaiMyNeural">HoaiMy (VN)</option>
+        <option value="en-US-JennyNeural">Jenny (EN)</option>
+    </select>
+
+    <button onclick="upload()">Convert</button>
+
+    <p id="status"></p>
+</div>
+
+<script>
+async function upload() {
+    const file = document.getElementById("file").files[0];
+    const voice = document.getElementById("voice").value;
+    const status = document.getElementById("status");
+
+    if (!file) {
+        status.innerText = "Chọn file!";
+        return;
+    }
+
+    status.innerText = "Đang xử lý...";
+
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("voice", voice);
+
+    const res = await fetch("/upload", {
+        method: "POST",
+        body: formData
+    });
+
+    const blob = await res.blob();
+
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "output.mp3";
+    a.click();
+
+    status.innerText = "Xong!";
+}
+</script>
+
+</body>
+</html>
