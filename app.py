@@ -3,11 +3,15 @@ import os
 import subprocess
 import srt
 import azure.cognitiveservices.speech as speechsdk
+from pydub import AudioSegment
 
 app = Flask(__name__)
 
-UPLOAD_FOLDER = "uploads"
-OUTPUT_FOLDER = "outputs"
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
+OUTPUT_FOLDER = os.path.join(BASE_DIR, "outputs")
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
@@ -29,7 +33,7 @@ def tts_azure(text, voice):
         region=SERVICE_REGION
     )
 
-    # ✅ FIX 1: ép Azure trả WAV chuẩn
+    # ✅ FIX: output WAV chuẩn
     speech_config.set_speech_synthesis_output_format(
         speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm
     )
@@ -44,7 +48,7 @@ def tts_azure(text, voice):
     result = synthesizer.speak_text_async(text).get()
 
     if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-        return result.audio_data
+        return bytes(result.audio_data)
 
     print("TTS ERROR:", result.reason)
     return None
@@ -67,6 +71,20 @@ def run_ffmpeg(cmd):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# ✅ NEW: merge bằng pydub (KHÔNG dùng ffmpeg concat)
+def merge_audio(files, output_path):
+    final_audio = AudioSegment.silent(duration=0)
+
+    for f in files:
+        if os.path.exists(f):
+            segment = AudioSegment.from_wav(f)
+            final_audio += segment
+        else:
+            print("Missing file:", f)
+
+    final_audio.export(output_path, format="wav")
+
+
 # =========================
 # 🚀 ROUTES
 # =========================
@@ -85,6 +103,10 @@ def upload():
     file.save(input_path)
 
     subs = parse_srt(input_path)
+
+    if len(subs) == 0:
+        return {"error": "Empty SRT file"}
+
     final_files = []
     current_time = 0
 
@@ -93,7 +115,6 @@ def upload():
         end = sub.end.total_seconds()
         duration = end - start
 
-        # 🔹 TTS
         audio_data = tts_azure(sub.content, voice)
         if not audio_data:
             continue
@@ -105,14 +126,7 @@ def upload():
         real_duration = get_audio_duration(temp_wav)
         adjusted_wav = f"{OUTPUT_FOLDER}/adj_{i}.wav"
 
-        # 🔹 FIX 2: normalize audio format
-        base_cmd = [
-            "ffmpeg", "-y",
-            "-i", temp_wav,
-            "-ar", "44100",
-            "-ac", "2"
-        ]
-
+        # normalize + adjust speed
         if real_duration > duration:
             speed = real_duration / duration
             filters = []
@@ -123,11 +137,14 @@ def upload():
 
             filters.append(f"atempo={speed}")
 
-            run_ffmpeg(base_cmd + [
+            run_ffmpeg([
+                "ffmpeg", "-y",
+                "-i", temp_wav,
                 "-filter:a", ",".join(filters),
+                "-ar", "44100",
+                "-ac", "2",
                 adjusted_wav
             ])
-
         else:
             silence_time = duration - real_duration
 
@@ -143,7 +160,7 @@ def upload():
                 adjusted_wav
             ])
 
-        # 🔹 FIX 3: thêm silence đầu để sync timeline
+        # thêm silence đầu để sync
         silence_before = start - current_time
 
         if silence_before > 0:
@@ -166,39 +183,37 @@ def upload():
         final_files.append(with_silence)
         current_time = end
 
-    # 🔹 FIX 4: concat đúng chuẩn (KHÔNG dùng copy)
-    list_path = os.path.join(OUTPUT_FOLDER, "concat_list.txt")
+    if len(final_files) == 0:
+        return {"error": "No audio generated"}
 
-    with open(list_path, "w", encoding="utf-8") as f:
-        for file_path in final_files:
-            f.write(f"file '{file_path}'\n")
-
+    # ✅ merge bằng pydub
     output_wav = os.path.join(OUTPUT_FOLDER, "output.wav")
+    merge_audio(final_files, output_wav)
 
-    run_ffmpeg([
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_path,
-        "-c:a", "pcm_s16le",
-        "-ar", "44100",
-        "-ac", "2",
-        output_wav
-    ])
+    if not os.path.exists(output_wav):
+        return {"error": "WAV not created"}
 
-    # 🔹 FIX 5: convert MP3 chuẩn
+    # convert sang MP3
     output_mp3 = os.path.join(OUTPUT_FOLDER, "output.mp3")
 
     run_ffmpeg([
         "ffmpeg", "-y",
         "-i", output_wav,
+        "-vn",
         "-ar", "44100",
         "-ac", "2",
         "-b:a", "192k",
         output_mp3
     ])
 
-    return send_file(output_mp3, as_attachment=True)
+    if not os.path.exists(output_mp3) or os.path.getsize(output_mp3) == 0:
+        return {"error": "MP3 failed"}
+
+    return send_file(
+        output_mp3,
+        as_attachment=True,
+        mimetype="audio/mpeg"
+    )
 
 
 # =========================
