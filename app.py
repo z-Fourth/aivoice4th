@@ -14,8 +14,8 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # 🔑 Azure config
-SPEECH_KEY = "YOUR_KEY"
-SERVICE_REGION = "eastasia"
+SPEECH_KEY = "FRWM9EPWSqtWOHmr37bRN81quMyXT1NnjqIVRrQku3g0C60vfKeIJQQJ99CCACYeBjFXJ3w3AAAYACOG70Xz"
+SERVICE_REGION = "eastus"
 
 
 # =========================
