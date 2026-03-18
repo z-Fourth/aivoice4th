@@ -1,0 +1,4 @@
+flask
+pydub
+srt
+azure-cognitiveservices-speech
